@@ -1,0 +1,409 @@
+---
+title: "Predicting Flight Arrival Delays from New York City Airports"
+subtitle: "HarvardX PH125.9x Data Science: Capstone – Choose Your Own Project"
+author: "Cristiano Camilo de Araujo Lelis"
+date: "`r format(Sys.Date(), '%Y-%m-%d')`"
+output:
+  pdf_document:
+    toc: true
+    number_sections: true
+header-includes:
+  - \usepackage{float}
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE,
+                      fig.align = "center", fig.width = 6, fig.height = 3.4,
+                      fig.pos = "H")   # keep each figure in place, moving it whole to the next page if needed
+
+if(!require(tidyverse)) install.packages("tidyverse", repos = "http://cran.us.r-project.org")
+if(!require(knitr)) install.packages("knitr", repos = "http://cran.us.r-project.org")
+library(tidyverse)
+library(knitr)
+
+# Load the results saved by aviation.R; run the full script first if they do not exist
+if(!file.exists("aviation_results.rds")) source("aviation.R")
+res <- readRDS("aviation_results.rds")
+
+# Helpers to format numbers in the text
+pct  <- function(x, digits = 1) paste0(format(round(100 * x, digits), nsmall = digits), "%")
+num  <- function(x) format(x, big.mark = ",", trim = TRUE)
+dec  <- function(x, digits = 3) format(round(x, digits), nsmall = digits)
+
+# Shortcuts used in the text
+cmp   <- res$model_comparison
+rf    <- cmp %>% filter(Model == "Random forest")
+glm   <- cmp %>% filter(Model == "Logistic regression")
+tree  <- cmp %>% filter(Model == "Decision tree")
+final <- res$final_confusion
+
+# Confusion counts on the validation set, rebuilt from the rates in the comparison table
+# (the baseline NPV is the share of on-time flights in the validation set)
+n_neg_valid <- round(res$n_valid_set * cmp$NPV[cmp$Model == "Baseline"])
+n_pos_valid <- res$n_valid_set - n_neg_valid
+tp_glm <- round(glm$Sensitivity * n_pos_valid)
+tp_rf  <- round(rf$Sensitivity * n_pos_valid)
+fp_glm <- round((1 - glm$Specificity) * n_neg_valid)
+fp_rf  <- round((1 - rf$Specificity) * n_neg_valid)
+```
+
+# Introduction
+
+Arrival delays are an operational and financial problem for commercial aviation. Delays impose substantial costs on passengers, on airlines (crew, fuel and maintenance) and on the economy as a whole, as shown by a comprehensive study sponsored by the U.S. Federal Aviation Administration (Ball et al., 2010). In regions with very dense air traffic, such as the New York City metropolitan area, the delay of a single flight can spread to other flights through the network. Although airport congestion and severe weather remain major causes of delays, a model that estimates the risk of a late arrival before departure could help airlines plan their ground operations in advance and help passengers reduce risks on tight connections. This project develops such a model, using only scheduling information that is known before departure.
+
+The data come from the Kaggle dataset "Flights", published under a CC0 (public domain) license, whose original source is the U.S. Bureau of Transportation Statistics (BTS). It contains all `r num(res$n_raw)` flights that departed from the three New York City airports (EWR, JFK and LGA) in 2013, with 21 variables, including scheduled and actual departure and arrival times, delays, carrier, flight number, aircraft tail number, origin, destination, air time and distance. The same flight records are also distributed in the `nycflights13` R package (Wickham), which is widely used in R tutorials, mainly to teach data wrangling and visualization rather than to predict delays, and is not used in the course textbook; the Kaggle version adds an index column (`id`) and the full carrier name (`name`). The table below describes the variables used in the analysis, after the data preparation described in the Methods section.
+
+```{r variables}
+tibble(
+  Variable = c("delayed", "month", "weekday", "sched_hour", "carrier",
+               "origin", "dest", "distance"),
+  Role = c("Target", rep("Predictor", 7)),
+  Type = c("Factor (no, yes)", "Factor (1-12)", "Factor (Mon-Sun)", "Numeric (5-23)",
+           "Factor (16 levels)", "Factor (3 levels)",
+           paste0("Factor (", nrow(res$destination_rates) - sum(res$destination_rates$n < 100) + 1, " levels)"),
+           "Numeric (miles)"),
+  Description = c("Arrival delay above 15 minutes",
+                  "Month of the flight",
+                  "Day of the week (from the date)",
+                  "Scheduled departure hour",
+                  "Airline code",
+                  "NYC departure airport",
+                  "Destination (rare ones as \"Other\")",
+                  "Flight distance")
+) %>%
+  kable(caption = "Variables used in the analysis")
+```
+
+The main goal of this project is to predict whether a flight will arrive more than 15 minutes late at its destination, using only information that is already known before departure. This restriction is essential for the model to be useful in practice and to avoid data leakage: variables that are common in retrospective analyses, such as the actual departure time or the departure delay, were discarded because they are unknown at the moment the prediction must be made. Since the data are imbalanced, with about three quarters of the flights arriving on time, performance is not measured by overall accuracy but by balanced accuracy, a metric that gives the same weight to correctly identifying on-time flights and delayed flights. As the main result, the final random forest model correctly identified about `r pct(final$byClass["Sensitivity"], 0)` of the delayed flights in the independent final test set.
+
+To reach this result, the project followed six consecutive steps. First, the data were cleaned by removing cancelled and diverted flights, and the binary target variable was defined following the BTS standard. Second, the clean data were split, with stratification, into a development set (90%) and a final test set (10%). Third, the variables were explored in detail to identify patterns and to investigate possible confounding factors through stratification. Fourth, feature engineering replaced the day of the month with the day of the week, extracted the scheduled departure hour and grouped rare destinations. Fifth, four models were trained and compared (a majority-class baseline, a logistic regression, a CART decision tree and a random forest), using 5-fold cross-validation to tune the hyperparameters and to choose the best classification threshold for each model. Finally, the best model was retrained on the complete development set and evaluated a single time on the final test set.
+
+# Methods and Analysis
+
+## Data cleaning
+
+```{r missing}
+tibble(Variable = names(res$missing), `Missing values` = res$missing) %>%
+  filter(`Missing values` > 0) %>%
+  mutate(`Missing values` = num(`Missing values`)) %>%
+  kable(caption = "Variables with missing values in the original data")
+```
+
+The missing values are concentrated in the variables that describe what actually happened during the flight. The `r num(res$missing["dep_time"])` flights without an actual departure time are cancelled flights: since the aircraft never took off, no real times were recorded. The arrival delay is missing for `r num(res$missing["arr_delay"])` flights, that is, about `r num(res$missing["arr_delay"] - res$missing["dep_time"])` more flights than the cancelled ones. These flights departed but have no recorded arrival delay, most likely because they were diverted to other airports. Since the goal is to predict delays of flights that completed their original route, the cancelled and diverted flights were removed. After cleaning, `r num(res$n_clean)` flights remain.
+
+The target variable, `delayed`, is a binary factor that takes the value "yes" when a flight arrived more than 15 minutes late, following the standard used by the U.S. Bureau of Transportation Statistics, and "no" otherwise.
+
+To build a realistic model, only variables known before departure were kept as predictors. The variables `dep_time`, `dep_delay`, `arr_time` and `air_time` were deliberately discarded: since they are only known after departure or arrival, including them would cause data leakage and hide the model's real ability to predict the risk of delay before the operation begins. Other variables were removed because they are identifiers or redundant: `id`, `flight` and `tailnum` are identifiers or variables with thousands of distinct values; `name` repeats the information in `carrier`; `time_hour` combines the date and hour variables; `year` is constant (all flights are from 2013); and `hour` and `minute` are components of `sched_dep_time`. The scheduled arrival time (`sched_arr_time`), although known before the flight, was also left out, because it is largely determined by `sched_dep_time` and `distance`. The seven predictors kept at this stage were `month`, `day`, `sched_dep_time`, `carrier`, `origin`, `dest` and `distance`.
+
+The proportion of delayed flights is `r pct(res$delay_rate)`. A model that always predicts "not delayed" would therefore reach an accuracy of about `r pct(1 - res$delay_rate)` without learning anything, which is why balanced accuracy, sensitivity and specificity are used to evaluate the models (Section 27.4 of the course textbook).
+
+## Train and final test split
+
+The clean data were split into a development set (`dev_set`, 90%, `r num(res$n_dev)` flights) and a final test set (`final_test`, 10%, `r num(res$n_final_test)` flights). The split was stratified by the target variable, so both sets keep practically the same proportion of delayed flights (about `r pct(res$delay_rate)`). The months were also balanced between the two sets: the largest difference in the share of flights of any month was 0.4 percentage points.
+
+The 90/10 proportion was chosen for two reasons. First, with about 32,700 flights in the final test set, the 95% margin of error of an accuracy around 76% is approximately ± 0.5 percentage points, which is precise enough to evaluate the final model; reserving 20% would reduce this margin only slightly while removing data from training. Second, delays are a minority event, and keeping 90% of the data for development maximizes the examples available for the models to learn from. Because of computing time, the heavier models were trained on a sample of the development set, as described in the validation strategy below. The `final_test` set was kept isolated during the whole development process and used only once, at the end, to evaluate the final model.
+
+## Data exploration
+
+All exploration was done on the development set only.
+
+### Month
+
+```{r month, fig.cap = "Delay rate by month (development set)"}
+res$month_rates %>%
+  ggplot(aes(x = month, y = delay_rate)) +
+  geom_col(fill = "steelblue") +
+  scale_y_continuous(labels = scales::percent) +
+  labs(x = "Month", y = "Proportion of delayed flights")
+```
+
+December has the highest delay rate (about 33%), followed by a high plateau in June and July (above 30%) and an intermediate peak in April (about 28%). September is the most punctual month (about 13%), followed by low and stable rates in October and November (about 17%). The dataset has no information on weather, airport capacity or seat occupancy, so the causes cannot be verified, but these patterns are consistent with known dynamics of the U.S. airline industry: December combines the heavy holiday traffic with the start of winter in the northeastern United States, when snowstorms require slow safety procedures such as aircraft de-icing; June and July combine the peak of leisure travel during the summer holidays with frequent afternoon thunderstorms on the East Coast; and from September to November, leisure demand falls after the return to school, in a season of more stable weather.
+
+Since the delay rate does not follow an increasing or decreasing trend over the year, `month` was used as a categorical variable (factor) in the models, and not as a number, which would force models such as the logistic regression to fit an invalid linear trend across months.
+
+### Scheduled departure hour
+
+```{r hour, fig.cap = "Delay rate by scheduled departure hour (development set)"}
+res$hour_rates %>%
+  ggplot(aes(x = sched_hour, y = delay_rate)) +
+  geom_col(fill = "steelblue") +
+  scale_x_continuous(breaks = seq(0, 23, 2)) +
+  scale_y_continuous(labels = scales::percent) +
+  labs(x = "Scheduled departure hour", y = "Proportion of delayed flights")
+```
+
+The scheduled departure time is stored in a compact format (for example, 1530 for 3:30 p.m.), so the scheduled hour was extracted with `floor(sched_dep_time / 100)`. The delay rate grows steadily during the day: flights scheduled between 5 and 7 a.m. have the lowest rates (about 10% to 11%), and the rate rises in an approximately linear way until it peaks between 7 and 9 p.m. (34% to 37%). A slight decrease appears from 10 p.m. onward, but it should be interpreted with caution: the 5 a.m., 10 p.m. and 11 p.m. slots have only `r num(res$hour_rates$n[res$hour_rates$sched_hour == 5])`, `r num(res$hour_rates$n[res$hour_rates$sched_hour == 22])` and `r num(res$hour_rates$n[res$hour_rates$sched_hour == 23])` flights, against roughly 9,000 to 24,000 in the other hours, so their rates are less reliable.
+
+The dataset does not track the previous flights of each aircraft, but this pattern is consistent with two operational realities. Early-morning flights usually use aircraft that spent the night at the airport, starting the day without delays inherited from previous flights. Later in the day, small delays accumulate across the several flights operated by the same aircraft (the so-called cascade effect), and afternoon summer thunderstorms may make this worse. Unlike the month, the delay rate shows a clear trend over the day, so the scheduled hour (`sched_hour`) was used as a numeric variable.
+
+### Origin airport
+
+```{r origin}
+res$origin_rates %>%
+  mutate(`Delay rate` = pct(delay_rate), Flights = num(n)) %>%
+  select(Origin = origin, Flights, `Delay rate`) %>%
+  kable(caption = "Delay rate by origin airport")
+```
+
+The difference between the airport with the lowest delay rate (LGA, 22.4%) and the one with the highest (EWR, 25.6%) is only about 3 percentage points, much smaller than the variation across months or hours. With about 100,000 flights per airport and a delay rate close to 25%, the standard error of each rate is only about 0.14 percentage points, so a 3-point difference is very unlikely to be due to chance: the difference is statistically real, but its practical size is modest. EWR is also the airport with the most departures in the development set. A possible explanation for its higher rate is congestion, but another is that each airport is the base of different carriers, which is investigated below. The variable `origin` has only three levels and was used as a factor.
+
+### Carrier
+
+```{r carrier, fig.height = 4, fig.cap = "Delay rate by carrier (development set)"}
+res$carrier_rates %>%
+  ggplot(aes(x = reorder(carrier, delay_rate), y = delay_rate)) +
+  geom_col(fill = "steelblue") +
+  coord_flip() +
+  scale_y_continuous(labels = scales::percent) +
+  labs(x = "Carrier", y = "Proportion of delayed flights")
+```
+
+```{r carrier-table}
+res$carrier_rates %>%
+  left_join(res$carrier_names, by = "carrier") %>%
+  arrange(desc(delay_rate)) %>%
+  mutate(`Delay rate` = pct(delay_rate), Flights = num(n)) %>%
+  select(Code = carrier, Carrier = name, Flights, `Delay rate`) %>%
+  kable(caption = "Delay rate by carrier (development set)")
+```
+
+The carriers show large differences. Frontier Airlines (F9) has the highest delay rate (37.5%), followed by AirTran Airways (FL), Mesa Airlines (YV) and ExpressJet Airlines (EV), while Hawaiian Airlines (HA) and Alaska Airlines (AS) have the lowest rates (12.3% and 14.4%). The raw range of 25.2 percentage points is, however, inflated by small carriers, which occupy both ends of the ranking. Considering only the carriers with more than 10,000 flights, the range falls to 13.5 points, from EV (31.4%) to US Airways (17.9%). The carrier therefore appears to be a relevant predictor, stronger than the origin airport, although weaker than the month or the scheduled hour.
+
+The reliability of the small carriers varies. SkyWest Airlines (OO) has only 26 flights, which gives a 95% margin of error of about ± 17 percentage points, so its rate is not reliable. Hawaiian Airlines (318 flights) and Frontier Airlines (618 flights) have margins of about ± 4 points: their rates are imprecise, but still informative. For large carriers such as EV and JetBlue (B6), with more than 46,000 flights each, the high delay rates are a consistent pattern supported by a large volume of data. The variable `carrier` was used as a factor; the case of OO is discussed in the feature engineering section.
+
+### Confounding between airport and carrier
+
+```{r strat}
+res$carrier_airport_strat %>%
+  mutate(across(c(EWR, JFK, LGA), ~ ifelse(is.na(.x), "—", pct(.x)))) %>%
+  rename(Carrier = carrier) %>%
+  kable(caption = "Delay rate of each carrier by origin airport (groups with at least 1,000 flights)")
+```
+
+Each New York airport is dominated by different carriers: EWR by United (UA, 38.9% of its departures) and ExpressJet (EV, 35.5%); JFK by JetBlue (B6, 38.2%); and LGA is more evenly divided among Delta, Envoy Air, American and US Airways. EV, one of the carriers with the highest delay rates, operates more than 81% of its flights from EWR. This composition is consistent with confounding: part of EWR's higher delay rate could reflect the carriers that operate there, rather than the airport itself (see Sections 18.2 and 19.4 of the course textbook).
+
+To investigate this, the delay rate of the same carrier was compared across airports (stratification, considering only groups with at least 1,000 flights). The evidence is mixed. There is no systematic airport effect: five carriers are more often late at EWR (DL, EV, MQ, UA and WN), while four are less often late there (9E, B6, US and VX). The variation within each carrier is small for UA, VX, WN and US, but large for 9E (about 11 points) and B6 (about 6 points). The stratification therefore suggests that part of the difference between airports comes from the mix of carriers, since EV has high delay rates at all three airports, but also that the airport effect is not uniform: it depends on the carrier. This interaction between carrier and airport is an important argument for tree-based models, which can represent interactions naturally, while a simple logistic regression only adds separate effects for carrier and airport.
+
+### Destination
+
+```{r dest}
+dest_big <- res$destination_rates %>% filter(n >= 1000)
+bind_rows(dest_big %>% arrange(desc(delay_rate)) %>% head(5) %>% mutate(Group = "Highest"),
+          dest_big %>% arrange(delay_rate) %>% head(5) %>% mutate(Group = "Lowest")) %>%
+  mutate(`Delay rate` = pct(delay_rate), Flights = num(n)) %>%
+  select(Group, Destination = dest, Flights, `Delay rate`) %>%
+  kable(caption = "Destinations with the highest and lowest delay rates (at least 1,000 flights)")
+```
+
+There are `r nrow(res$destination_rates)` distinct destinations. Among the destinations with at least 1,000 flights, the delay rate ranges from 18.2% (Miami, MIA) to 35.5% (Richmond, RIC), a difference of 17.3 percentage points, which suggests that the destination is relevantly associated with delays. Several destinations at the top of the ranking, such as RIC, GSO, CVG, JAX and MCI, are medium-sized cities typically served by regional flights, which is the profile of carriers such as ExpressJet (EV), whose delay rates are high at all three New York airports. Part of their high rates may therefore be associated with the carriers that operate these routes, a hypothesis that was not verified directly.
+
+This high cardinality requires care in the modeling. In a logistic regression, rare destinations produce unstable coefficients, and a destination present in the test set but absent from the training data would make prediction impossible. In addition, the classic `randomForest` package for R does not accept categorical variables with more than 53 levels, which led to the use of the `ranger` package. Finally, `r sum(res$destination_rates$n < 100)` destinations have fewer than 100 flights in the development set: the smaller the number of flights, the larger the influence of each individual flight on the estimated rate, so these rates tend to reflect random variation more than an operational pattern.
+
+### Distance
+
+```{r distance}
+res$distance_bins_summary %>%
+  mutate(`Delay rate` = pct(delay_rate), Flights = num(n)) %>%
+  select(`Distance (miles)` = distance_bin, Flights, `Delay rate`) %>%
+  kable(caption = "Delay rate by distance bin")
+```
+
+Distance is a continuous variable with thousands of distinct values, so it was grouped into six bins with the function `cut()` (each bin includes its upper limit). The delay rate does not follow a linear trend over most of the distances: up to 2,000 miles it remains practically stable, between 23% and 25%, and it only decreases in the longest bins, to 21.0% between 2,000 and 3,000 miles and 16.6% above 3,000 miles.
+
+The longest bin should be interpreted with caution. It has only 652 flights and, departing from New York, it corresponds almost entirely to the Honolulu routes, operated in similar proportions by Hawaiian Airlines (from JFK) and United (from EWR), plus a few United flights to Anchorage. Since Hawaiian Airlines has the lowest delay rate in the study, the lower rate of this bin may partly reflect the carriers that operate these routes, and not only the distance. A possible operational explanation for the lower rates of long flights is that airlines add a time margin to the schedule of long flights (schedule padding), so that a departure delay can be absorbed during the flight. The variable `distance` was used as a numeric predictor, with the caveat that its effect is weak and non-linear; tree-based models are expected to capture the change above 2,000 miles better. Since the distance is practically determined by the origin–destination pair, `distance` and `dest` carry similar information.
+
+### Day of the month and day of the week
+
+```{r day, fig.cap = "Delay rate by day of the month (development set)"}
+res$day_rates %>%
+  ggplot(aes(x = day, y = delay_rate)) +
+  geom_line(color = "steelblue", linewidth = 1) +
+  geom_point(color = "darkblue", size = 1.5) +
+  scale_x_continuous(breaks = seq(1, 31, 2)) +
+  scale_y_continuous(labels = scales::percent) +
+  labs(x = "Day of the month", y = "Proportion of delayed flights")
+```
+
+```{r weekday, fig.cap = "Delay rate by day of the week (development set)"}
+res$weekday_rates %>%
+  ggplot(aes(x = weekday, y = delay_rate)) +
+  geom_col(fill = "steelblue") +
+  scale_y_continuous(labels = scales::percent) +
+  labs(x = "Day of the week", y = "Proportion of delayed flights")
+```
+
+The delay rate by day of the month varies between 16.2% (day 6) and 33.2% (day 22), with isolated peaks (days 8, 22 and 23) and troughs (days 4 to 6 and day 15), but no regular trend or cycle. All days have more than 5,000 flights, with a 95% margin of error of at most about ± 1.1 percentage points, so these differences are not sampling noise. Each point, however, combines the same calendar day across twelve different months (day 8 combines January 8, February 8 and so on), so a single event on a specific date, such as a strong storm, raises the whole point. The differences are real, but they reflect events of specific dates of 2013, which should not repeat in other years.
+
+There is also a risk of data leakage: together, `day` and `month` identify the exact date of each flight. Since the split between `dev_set` and `final_test` was random within the same year, the test set contains flights from the same dates as the development set, and a tree-based model could learn rules such as "flights on December 22 were very late" and correctly predict test flights affected by the same event. The test performance would look better, but the model would not be useful for future dates. For this reason, `day` was removed from the models and replaced by the day of the week (`weekday`), a pattern that repeats every week. It was created with the functions `make_date()` and `wday()` of the lubridate package, with the week starting on Monday and the day names set in English.
+
+The day of the week shows a clear pattern. Thursday has the highest delay rate (27.7%), followed by Friday (26.1%) and Monday (25.4%), while Tuesday (22.9%) and Wednesday (23.6%) are intermediate. Sunday (21.8%) is the second most punctual day, and Saturday is by far the most punctual one (16.9%). Saturday also has fewer scheduled flights (`r num(res$weekday_rates$n[res$weekday_rates$weekday == "Sat"])`, against about 44,000 on each weekday), which is consistent with less congestion at the airports and in the airspace. On the weekdays, however, the number of flights is practically the same, while the delay rates differ clearly, so volume alone does not explain the differences. A possible explanation is aircraft load: flights on Thursdays, Fridays and Mondays may carry more passengers and baggage, because of business travel and weekend trips, which would lengthen boarding and increase the chance of cascading delays. The dataset has no occupancy data, so this hypothesis cannot be verified. Since the rate oscillates over the week without a linear trend, `weekday` was used as a factor.
+
+### Summary of the exploration
+
+```{r amplitudes}
+range_of <- function(x) max(x) - min(x)
+tibble(
+  Predictor = c("Scheduled hour", "Month", "Destination (at least 1,000 flights)",
+                "Carrier (> 10,000 flights)", "Day of the week", "Distance", "Origin"),
+  `Range of delay rates` = c(
+    range_of(res$hour_rates$delay_rate),
+    range_of(res$month_rates$delay_rate),
+    range_of(dest_big$delay_rate),
+    range_of(res$carrier_rates$delay_rate[res$carrier_rates$n > 10000]),
+    range_of(res$weekday_rates$delay_rate),
+    range_of(res$distance_bins_summary$delay_rate),
+    range_of(res$origin_rates$delay_rate))
+) %>%
+  mutate(`Range of delay rates` = paste(dec(100 * `Range of delay rates`, 1), "pp")) %>%
+  kable(caption = "Difference between the highest and lowest delay rates of each predictor (percentage points)")
+```
+
+The scheduled hour and the month show the largest differences in delay rates, followed by the destination, the carrier and the day of the week, while the distance and, above all, the origin airport show the smallest. This comparison is univariate, since each predictor is analysed in isolation, and it uses different volume criteria for some predictors, so it is only an indication of their relative strength, not a definitive measure of their importance in the models.
+
+## Feature engineering and rare categories
+
+Based on the decisions of the exploration, the same feature engineering was applied to both sets. The day of the month (`day`) was replaced by the day of the week (`weekday`), and the scheduled departure time (`sched_dep_time`) was replaced by the scheduled hour (`sched_hour`), used as a numeric variable; the original columns were then discarded. The variables `month` and `origin` were converted into factors. The final predictors are therefore `month`, `weekday`, `sched_hour`, `carrier`, `origin`, `dest` and `distance`.
+
+Rare categories were also treated. The `r sum(res$destination_rates$n < 100)` destinations with fewer than 100 flights in the development set were grouped into a single category, "Other" (`r num(sum(res$destination_rates$n[res$destination_rates$n < 100]))` flights), to avoid unstable estimates for very small groups; as a result, `dest` went from `r nrow(res$destination_rates)` to `r nrow(res$destination_rates) - sum(res$destination_rates$n < 100) + 1` categories. A check before grouping confirmed that every destination in the final test set also appears in the development set, so the grouping was needed only to deal with instability, and not with unseen destinations. The same principle was evaluated for the carriers, but a threshold of 100 flights would group only SkyWest Airlines (OO), which would not solve anything, while a high threshold such as 1,000 flights would merge carriers with opposite behaviors, such as Hawaiian Airlines (the most punctual) and Frontier Airlines (the most delayed). All carriers were therefore kept, and OO, with only 26 flights, was accepted as a known limitation, with a negligible impact on the overall results.
+
+To avoid data leakage, the rare categories were identified using the development set only. In the final test set, the factors use exactly the same levels as in the development set, and rare destinations are converted to "Other". It was verified that there are no new carriers in the final test set, that the factor levels are identical in both sets and that the final test set has no missing values.
+
+## Validation strategy
+
+The development set was split again, with stratification by the target variable, into a training part (`train_set`, 80%, `r num(res$n_train_set)` flights) and a validation part (`valid_set`, 20%, `r num(res$n_valid_set)` flights). Because of the computing time required on a conventional computer, the models were trained on a stratified sample of `r num(res$n_train_sample)` flights from the training part (`train_sample`).
+
+These proportions were chosen for practical reasons. The 80/20 split keeps most of the development data for training, while the validation set, with almost 59,000 flights, is large enough to compare the models precisely (the 95% margin of error of an accuracy around 76% is about ± 0.35 percentage points). The sample of about 50,000 flights made it possible to tune all models, including the random forest, which requires training 15 forests in the cross-validation, in several minutes on a conventional computer, while still providing a large number of flights for each model. Five folds were used in the cross-validation as a balance between computing time and stability: each fold leaves out about 10,000 flights to evaluate the model, enough for stable estimates of the AUC and of the balanced accuracy.
+
+Each part has a specific role. A 5-fold cross-validation within the training sample was used to tune the hyperparameters of the models and to choose their classification thresholds. The validation set was used independently to compare the models with each other. The final test set remained isolated and was used only once, at the end, with the chosen model. The proportion of delayed flights stayed at about `r pct(res$delay_rate)` in all subsets, and no category was left without flights in the training sample, although OO kept only 2 flights, which reinforces the limitation described above.
+
+## Models
+
+Four models were compared: a baseline that always predicts "not delayed", a logistic regression, a decision tree (CART) and a random forest. Hyperparameters were chosen by 5-fold cross-validation on the training sample, using the area under the ROC curve (AUC). The AUC was preferred to accuracy because accuracy favors models that predict almost every flight as "not delayed", given the class imbalance, while the AUC measures the ability of a model to rank flights by risk, regardless of the threshold, which is chosen in a separate step.
+
+The algorithms were chosen to increase in complexity, each one addressing a weakness of the previous one. The logistic regression is a simple and interpretable reference model, whose coefficients show the direction of the effect of each predictor, but it assumes additive effects and cannot represent interactions unless they are specified explicitly. The decision tree can capture non-linear patterns, such as the drop in delays above 2,000 miles, and interactions, such as the carrier and airport interaction found in the exploration, but a single tree is unstable. The random forest, which goes beyond linear and logistic regression, reduces this instability by averaging many trees, each trained on a different sample of flights and of variables.
+
+The baseline sets the minimum level of performance. On the validation set, it has a balanced accuracy of `r dec(cmp$"Balanced accuracy"[cmp$Model == "Baseline"], 3)`, a sensitivity of 0 and a specificity of 1: it does not identify any delayed flight. Any useful model must therefore reach a balanced accuracy above 0.5 and a sensitivity above 0. Since only information known before departure is available, and factors such as last-minute weather and delays inherited from previous flights are not in the data, the models were expected to improve on the baseline only modestly.
+
+### Classification threshold
+
+```{r thresholds, fig.cap = "Cross-validated balanced accuracy by classification threshold"}
+res$threshold_curves %>%
+  pivot_longer(-threshold, names_to = "model", values_to = "balanced_accuracy") %>%
+  mutate(model = recode(model, logistic = "Logistic regression",
+                        tree = "Decision tree", forest = "Random forest")) %>%
+  ggplot(aes(x = threshold, y = balanced_accuracy, color = model)) +
+  geom_line(linewidth = 1) +
+  labs(x = "Threshold", y = "Balanced accuracy (cross-validation)", color = "Model")
+```
+
+The models estimate a probability of delay for each flight, and a flight is classified as delayed when this probability exceeds a threshold. With the default threshold of 0.5, the logistic regression predicted a delay for only `r pct(res$glm_confusion_05$byClass["Detection Prevalence"])` of the flights, although `r pct(res$delay_rate)` are actually delayed, and identified only `r pct(res$glm_confusion_05$byClass["Sensitivity"])` of the delayed flights. With imbalanced classes, the models rarely estimate a probability above 50%, so this threshold is inadequate.
+
+For each model, thresholds from 0.10 to 0.60, in steps of 0.01, were tested on the out-of-fold predictions of the cross-validation, and the threshold that maximizes the balanced accuracy was chosen. The validation set was not used in this choice. The figure shows the resulting curves. The chosen thresholds were `r cmp$Threshold[cmp$Model == "Logistic regression"]` for the logistic regression, `r cmp$Threshold[cmp$Model == "Decision tree"]` for the decision tree and `r cmp$Threshold[cmp$Model == "Random forest"]` for the random forest, all very close to the proportion of delayed flights (`r dec(res$delay_rate, 3)`). The decision tree curve is flat at 0.5 for low thresholds and then jumps, because a tree gives the same probability to all flights in the same leaf: below the smallest leaf probability, every flight is classified as delayed.
+
+### Logistic regression
+
+The logistic regression was trained with the seven predictors on the training sample, with a cross-validated AUC of `r dec(glm$"AUC (CV)", 3)`. With the default threshold of 0.5, its accuracy (`r dec(res$glm_confusion_05$overall["Accuracy"], 3)`) was not statistically higher than that of the baseline (p = `r dec(res$glm_confusion_05$overall["AccuracyPValue"], 2)`), and its balanced accuracy was only `r dec(res$glm_confusion_05$byClass["Balanced Accuracy"], 3)`. With the threshold of `r glm$Threshold`, chosen by cross-validation, the results on the validation set were: balanced accuracy `r dec(glm$"Balanced accuracy", 3)`, sensitivity `r dec(glm$Sensitivity, 3)`, specificity `r dec(glm$Specificity, 3)` and Kappa `r dec(glm$Kappa, 3)`. The balanced accuracy estimated by cross-validation (`r dec(max(res$threshold_curves$logistic), 3)`) is practically the same as on the validation set, which indicates that the threshold generalizes well.
+
+The overall accuracy falls below that of the baseline, because identifying more delays also generates more false alarms. This trade-off is expected and reinforces the choice of balanced accuracy as the main metric. In practice, when the model predicts a delay it is correct in `r pct(glm$PPV)` of the cases, and when it predicts an on-time flight it is correct in `r pct(glm$NPV)`, so it is more useful to rule out low-risk flights than to confirm delays.
+
+The coefficient of `sched_hour` (`r dec(res$glm_coefs["sched_hour"], 3)`) agrees with the exploration: the odds of delay are multiplied by about `r dec(exp(res$glm_coefs["sched_hour"]), 2)` for each later hour of scheduled departure. The coefficient of `distance` (`r format(signif(res$glm_coefs["distance"], 2))`), however, is positive, the opposite of the decreasing trend seen in the exploration. Since the distance is practically determined by the origin–destination pair, the effects of `dest` and `origin` absorb most of the information of the distance. This multicollinearity makes the coefficient of `distance` unstable, so it should not be interpreted in isolation. It affects only the interpretation of the coefficients, not the quality of the predictions, and it is another argument for testing tree-based models.
+
+### Decision tree
+
+```{r tree-tuning}
+res$tree_tuning %>%
+  select(cp, AUC = ROC) %>%
+  mutate(AUC = dec(AUC, 3)) %>%
+  kable(caption = "Decision tree: cross-validated AUC by complexity parameter (cp)")
+```
+
+The decision tree (CART, `rpart` package) was trained on the training sample, with the complexity parameter (`cp`) chosen by cross-validation. In a first search, values of `cp` of 0.002 and above produced trees with no splits at all (AUC of 0.5), which shows that the patterns in these data are weak and only captured by large trees. Since the best value was repeatedly at the lower limit of the grid, the search was extended down to `cp` = 0, a fully grown tree. As the table shows, the AUC increases up to `cp` = `r format(res$tree_tuning$cp[which.max(res$tree_tuning$ROC)], scientific = FALSE)` (`r dec(max(res$tree_tuning$ROC), 3)`) and decreases for smaller values (`r dec(res$tree_tuning$ROC[res$tree_tuning$cp == 0], 3)` for `cp` = 0), indicating overfitting in the largest trees. The chosen value is therefore inside the grid.
+
+With the threshold of `r tree$Threshold`, the tree reached a balanced accuracy of `r dec(max(res$threshold_curves$tree), 3)` in cross-validation and `r dec(tree$"Balanced accuracy", 3)` on the validation set, with a sensitivity of `r dec(tree$Sensitivity, 3)`, a specificity of `r dec(tree$Specificity, 3)` and a Kappa of `r dec(tree$Kappa, 3)`. Despite its ability to capture interactions, such as the carrier and airport interaction found in the exploration, the tree performed worse than the logistic regression in AUC and balanced accuracy. Two features of these results help explain this. First, a tree gives the same probability to all flights in the same leaf, so it ranks the flights by risk only in steps; this is visible in the step-shaped curve of the tree in the threshold figure, and it directly lowers the AUC, which measures exactly this ranking. Second, the tree was sensitive to its size: the cross-validated AUC fell from `r dec(max(res$tree_tuning$ROC), 3)` to `r dec(res$tree_tuning$ROC[res$tree_tuning$cp == 0.0002], 3)` when `cp` went from 0.0001 to 0.0002, and to `r dec(res$tree_tuning$ROC[res$tree_tuning$cp == 0], 3)` with a fully grown tree. A random forest addresses both problems: averaging the probabilities of many trees produces a much finer ranking of the flights and reduces the dependence on the structure of a single tree.
+
+### Random forest
+
+```{r rf-tuning}
+res$rf_tuning %>%
+  select(mtry, AUC = ROC) %>%
+  mutate(AUC = dec(AUC, 3)) %>%
+  kable(caption = "Random forest: cross-validated AUC by mtry (200 trees, Gini split rule, minimum node size 20)")
+```
+
+The random forest combines many decision trees, each grown on a bootstrap sample of the flights and considering a random subset of the variables at each split. It was trained with the `ranger` package, because the classic `randomForest` package does not accept categorical variables with more than 53 levels, and the destination has `r nrow(res$destination_rates) - sum(res$destination_rates$n < 100) + 1` categories. To keep the computing time manageable, the number of trees was set to 200. The Gini split rule was used, and the minimum number of flights in each terminal node was set to 20, to avoid leaves with very few flights, which would harm the estimated probabilities.
+
+The number of variables sampled at each split (`mtry`) was chosen by cross-validation among 5, 11 and 20, values set around the square root of the number of columns after the categorical variables are converted into indicator columns (about 130). The best value was `mtry` = `r res$rf_tuning$mtry[which.max(res$rf_tuning$ROC)]`, inside the grid, with an AUC of `r dec(max(res$rf_tuning$ROC), 3)`. The differences between the values were small (from `r dec(min(res$rf_tuning$ROC), 3)` to `r dec(max(res$rf_tuning$ROC), 3)`), indicating little sensitivity to this parameter in the tested range. With the threshold of `r rf$Threshold`, the random forest reached a balanced accuracy of `r dec(max(res$threshold_curves$forest), 3)` in cross-validation and `r dec(rf$"Balanced accuracy", 3)` on the validation set, values that are practically the same, which indicates a stable model without overfitting.
+
+# Results
+
+## Model comparison on the validation set
+
+```{r comparison}
+cmp %>%
+  mutate(across(where(is.numeric), ~ ifelse(is.na(.x) | is.nan(.x), "—", dec(.x, 3)))) %>%
+  kable(caption = "Model comparison on the validation set")
+```
+
+The table above was built directly from the objects created by the script (confusion matrices, cross-validated AUCs and chosen thresholds), which guarantees consistency between the code and this report. The positive predictive value (PPV) of the baseline is undefined, because it never predicts a delay, and is shown as "—".
+
+All models outperformed the baseline. The random forest had the best performance, with the highest AUC (`r dec(rf$"AUC (CV)", 3)`), balanced accuracy (`r dec(rf$"Balanced accuracy", 3)`), specificity (`r dec(rf$Specificity, 3)`), Kappa (`r dec(rf$Kappa, 3)`) and predictive values. The logistic regression had the highest sensitivity (`r dec(glm$Sensitivity, 3)`), but with a lower specificity (`r dec(glm$Specificity, 3)`), that is, more false alarms, a trade-off that justifies the use of balanced accuracy as the main metric. The random forest clearly outperformed the single decision tree (`r dec(rf$"Balanced accuracy", 3)` against `r dec(tree$"Balanced accuracy", 3)`), which is consistent with the idea that combining many trees reduces instability, but its gain over the logistic regression (`r dec(glm$"Balanced accuracy", 3)`) was modest. In terms of flights, on the `r num(res$n_valid_set)` flights of the validation set, the random forest raised `r num(fp_glm - fp_rf)` fewer false alarms than the logistic regression (`r num(fp_rf)` against `r num(fp_glm)` on-time flights flagged as delayed), while detecting only `r num(tp_glm - tp_rf)` fewer delayed flights (`r num(tp_rf)` against `r num(tp_glm)`). The gain of the random forest therefore comes almost entirely from fewer false alarms, which matters for an airline that would allocate resources to the flagged flights. These limited gains, with a balanced accuracy of about 0.65 for the best model, reflect the difficulty of predicting delays using only information known before departure. The random forest was therefore chosen as the final model.
+
+## Variable importance
+
+```{r importance, fig.cap = "Random forest variable importance, summed by original predictor"}
+res$rf_importance %>%
+  ggplot(aes(x = reorder(variable, importance), y = importance)) +
+  geom_col(fill = "steelblue") +
+  coord_flip() +
+  labs(x = "Predictor", y = "Importance (sum of impurity decrease)")
+```
+
+The `ranger` package computes the impurity importance (decrease in Gini impurity) for each indicator column created from the categorical variables, so the importances were summed back into the seven original predictors. The resulting ranking is: `r paste0(res$rf_importance$variable, " (", format(round(res$rf_importance$importance), big.mark = ",", trim = TRUE), ")", collapse = ", ")`.
+
+From the fourth to the seventh position, this ranking matches exactly the order of the univariate ranges of delay rates observed in the exploration. The origin airport is in last place, confirming its low strength, and the distance is in the second to last place, which is consistent with its redundancy with the origin–destination pair. The first position of `dest` should be interpreted with caution: impurity importance tends to favor numeric variables, such as `sched_hour`, and categorical variables with many categories, such as `dest`, because both offer many possible split points. The ranking therefore shows that the model used the destination intensively to split the flights, but not, by itself, that the destination is the main cause of delays.
+
+## Final model and evaluation on the final test set
+
+```{r final}
+tibble(Metric = c("Accuracy", "Sensitivity", "Specificity", "Balanced accuracy",
+                  "Kappa", "Positive predictive value", "Negative predictive value"),
+       Value = c(final$overall["Accuracy"], final$byClass["Sensitivity"],
+                 final$byClass["Specificity"], final$byClass["Balanced Accuracy"],
+                 final$overall["Kappa"], final$byClass["Pos Pred Value"],
+                 final$byClass["Neg Pred Value"])) %>%
+  mutate(Value = dec(Value, 3)) %>%
+  kable(caption = "Final random forest on the final test set")
+```
+
+The random forest was retrained a single time on the complete development set (`r num(res$n_dev)` flights), with the hyperparameters chosen by cross-validation kept fixed (`mtry` = `r res$rf_tuning$mtry[which.max(res$rf_tuning$ROC)]`, Gini split rule, minimum node size of 20 and 200 trees) and without any new tuning. The same principle was used in the MovieLens project: tuning the model on part of the data and retraining it on all the development data before the final evaluation. The threshold of `r rf$Threshold`, chosen by cross-validation, was also kept. The final test set (`r num(res$n_final_test)` flights) remained isolated during the whole development and was used only once, with no adjustment after seeing the results.
+
+On the final test set, the model reached a balanced accuracy of `r dec(final$byClass["Balanced Accuracy"], 3)`, practically the same as on the validation set (`r dec(rf$"Balanced accuracy", 3)`), which indicates that it generalizes well to unseen flights from the same period. The small improvement may be related to the retraining with more data, but it is within the margin of error: the 95% confidence interval of the accuracy (from `r dec(final$overall["AccuracyLower"], 3)` to `r dec(final$overall["AccuracyUpper"], 3)`) corresponds to a margin of about ± 0.5 percentage points, consistent with the precision expected for this test set size. Since the final test set was drawn from the same year as the training data, these results do not show the performance of the model in future years.
+
+In practical terms, the final model identifies about `r pct(final$byClass["Sensitivity"], 0)` of the flights that will arrive more than 15 minutes late, using only information known before departure from New York. When it predicts a delay, it is correct in `r pct(final$byClass["Pos Pred Value"], 0)` of the cases; when it predicts an on-time flight, it is correct in `r pct(final$byClass["Neg Pred Value"], 0)` of the cases.
+
+# Conclusion
+
+This project developed a model to predict the arrival delays of commercial flights departing from the three airports of the New York City metropolitan area in 2013. After cleaning the data, exploring the predictors, engineering new features and choosing the decision thresholds by cross-validation, four approaches were evaluated. The random forest, implemented with the `ranger` package, had the best performance, outperforming the baseline, the logistic regression and the single decision tree. Evaluated a single time on the independent final test set, the retrained random forest reached an accuracy of `r dec(final$overall["Accuracy"], 3)`, a sensitivity of `r dec(final$byClass["Sensitivity"], 3)`, a specificity of `r dec(final$byClass["Specificity"], 3)`, a balanced accuracy of `r dec(final$byClass["Balanced Accuracy"], 3)` and a Kappa of `r dec(final$overall["Kappa"], 3)`. These results show that, even using only static information known before departure, the model captured consistent patterns found in the exploration: delays become more frequent as the scheduled hour advances, they are concentrated in December and in the summer months, they are more common on Thursdays, Fridays and Mondays than on Saturdays, and they vary with the destination and the carrier.
+
+**Potential impact.** In practice, the random forest could be used by airlines as a risk score computed in advance for each scheduled flight, since all its predictors are known well before departure (for example, 24 to 48 hours ahead). Its main practical value lies in identifying low-risk flights: when the model predicts that a flight will be on time, it is correct in `r pct(final$byClass["Neg Pred Value"])` of the cases on the final test set. Operations managers could therefore focus contingency resources, such as spare crews and ground buffers, on the flights flagged as high risk. Even with a modest positive predictive value of `r pct(final$byClass["Pos Pred Value"])`, which reflects the limits of predicting dynamic events with static pre-departure data, the flights flagged by the model are delayed about `r format(round(final$byClass["Pos Pred Value"] / final$byClass["Prevalence"], 1), nsmall = 1)` times as often as the average flight (`r pct(final$byClass["Prevalence"])`). This could support crew and ground planning and help reduce the risk that a local disruption spreads through an airline's network.
+
+**Limitations.** The model has important limitations that restrict its performance and its generalization. First, it uses only information known before departure, leaving out dynamic factors such as real-time weather (snowstorms or thunderstorms), sudden mechanical problems and the cascade of delays carried by the rotation of the aircraft. Second, the data cover only 2013, and the final test set was drawn from the same year, so the patterns learned by the model, such as the seasonal ones, may be specific to that year, and its performance in future years was not evaluated. Third, because of the computing cost, the choice of hyperparameters and the comparison of the models used a sample of `r num(res$n_train_sample)` flights; a search with more data could lead to better hyperparameters. Fourth, carriers with very few flights, such as SkyWest Airlines (OO), with only 2 flights in the training sample, produce unstable estimates. Finally, cancelled flights were removed during cleaning and were not modelled, and the impurity importance used to rank the predictors has a known bias in favor of variables with many categories (such as the destination) and numeric variables (such as the scheduled hour).
+
+**Future work.** Three main directions are proposed to go beyond the performance limit of the current approach:
+
+- **Weather data:** adding historical weather observations for the airports, such as METAR reports with visibility, wind and thunderstorm activity. Weather forecasts available before departure would keep the model usable in advance, while observations closer to the departure time could improve predictions over shorter horizons.
+- **Aircraft rotation and delay propagation:** the aircraft tail number (`tailnum`) could be used to reconstruct the sequence of flights of each aircraft. Knowing whether the incoming flight of the same aircraft is late would capture delay propagation, one of the main operational causes of late departures. This would require data on the flights arriving in New York, which are not part of this dataset.
+- **Validation over time:** instead of a random split within the same year, training the model on 2013 data and testing it on later years would show how well it adapts to long-term changes in airline networks and airport capacity.
+
+# References
+
+- Ball, M., Barnhart, C., Dresner, M., Hansen, M., Neels, K., Odoni, A., Peterson, E., Sherry, L., Trani, A. and Zou, B. (2010). *Total Delay Impact Study: A Comprehensive Assessment of the Costs and Impacts of Flight Delay in the United States*. NEXTOR, report for the Federal Aviation Administration. https://rosap.ntl.bts.gov/view/dot/6234
+- U.S. Bureau of Transportation Statistics. *Airline On-Time Performance Data* (original source of the flight records).
+- Wickham, H. *nycflights13: Flights that Departed NYC in 2013*. R package (data from the U.S. Bureau of Transportation Statistics). https://CRAN.R-project.org/package=nycflights13
+- mahoora00135. *Flights* [dataset]. Kaggle. License: CC0 Public Domain. https://www.kaggle.com/datasets/mahoora00135/flights
+- Irizarry, R. A. *Introduction to Data Science: Data Analysis and Prediction Algorithms with R*. In particular, Sections 18.2 and 19.4 (confounding), 27.4 (evaluation metrics, including balanced accuracy), 29 (cross validation), 30 (the caret package), 31.3 (logistic regression), 31.10 and 31.11 (decision trees and random forests) and 32.3 (variable importance).
+- Kuhn, M. *caret: Classification and Regression Training*. R package. https://CRAN.R-project.org/package=caret
+- Wright, M. N. and Ziegler, A. (2017). ranger: A Fast Implementation of Random Forests for High Dimensional Data in C++ and R. *Journal of Statistical Software*, 77(1), 1–17.
+- Therneau, T. and Atkinson, B. *rpart: Recursive Partitioning and Regression Trees*. R package. https://CRAN.R-project.org/package=rpart
+- R Core Team. *R: A Language and Environment for Statistical Computing*. R Foundation for Statistical Computing, Vienna, Austria.
+- Anthropic. Claude (generative AI tool), used during this project as described in the note on sources at the top of `aviation.R`.
